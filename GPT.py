@@ -3,14 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 8 # what is the maximum context length for predictions?
-max_iterations = 3000
-eval_interval = 300
-learning_rate = 1e-2
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
+max_iterations = 5000
+eval_interval = 500
+learning_rate = 1e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-embedding_vector_size = 32
+embedding_vector_size = 384
+num_heads = 6
+num_layer = 6
+dropout = 0.2
 # ------------
 
 torch.manual_seed(1337)
@@ -64,6 +67,83 @@ def estimate_loss():
     model.train()
     return out
 
+class Head(nn.Module):
+    """ one head of self-attention """
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(embedding_vector_size, head_size, bias=False)
+        self.query = nn.Linear(embedding_vector_size, head_size, bias=False)
+        self.value = nn.Linear(embedding_vector_size, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # input of size (batch, time-step, channels)
+        # output of size (batch, time-step, head size)
+        B,T,C = x.shape
+        k = self.key(x)   # (B,T,head size)
+        q = self.query(x) # (B,T,head size)
+        # compute attention scores ("affinities")
+        # Transpose to swal the inner dimensions so that we can matrix multiplication
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x) # (B,T,hs)
+        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
+
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, embedding_vector_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
+
+class FeedFoward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
+
+    def __init__(self, embedding_vector_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embedding_vector_size, 4 * embedding_vector_size),
+            nn.ReLU(),
+            nn.Linear(4 * embedding_vector_size, embedding_vector_size),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+
+    def __init__(self, embedding_vector_size, num_heads):
+        # n_embd: embedding dimension, n_head: the number of heads we'd like
+        super().__init__()
+        head_size = embedding_vector_size // num_heads
+        # Double // rounds down to closes integer
+        self.sa_heads = MultiHeadAttention(num_heads, head_size) # 4 heads of self-attention 8-dimensional each. Contactenated to return 32-dimensional
+        self.feed_forward = FeedFoward(embedding_vector_size)
+        self.ln1 = nn.LayerNorm(embedding_vector_size)
+        self.ln2 = nn.LayerNorm(embedding_vector_size)
+
+    def forward(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.feed_forward(self.ln2(x))
+        return x
+
 # super simple bigram model
 class BigramLanguageModel(nn.Module):
 
@@ -72,7 +152,10 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(chars_size, embedding_vector_size)
         self.position_embedding_table = nn.Embedding(block_size, embedding_vector_size)
-
+        
+        self.blocks = nn.Sequential(*[Block(embedding_vector_size, num_heads=num_heads) for _ in range(num_layer)]) # 4 layers of transformer blocks
+        self.layer_normalizer = nn.LayerNorm(embedding_vector_size)
+        
         # language model head, input embedding and output logit scores for each character
         self.lm_head = nn.Linear(embedding_vector_size, chars_size)
 
@@ -85,8 +168,9 @@ class BigramLanguageModel(nn.Module):
         embedding_for_position = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         # Pytorch just adds and empty dimension to the position embedding to make the shapes match
         x = embedding_for_token + embedding_for_position # (B,T,C)
+        x = self.blocks(x) # (B,T,C)
         # Logits are the scores for each character in the vocabulary
-        logits = self.lm_head(embedding_for_token) # (B,T,vocab_size)
+        logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
             loss = None
@@ -104,8 +188,10 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # focus only on the last time step
             logits = logits[:, -1, :] # becomes (B, C)
             # apply softmax to get probabilities

@@ -2,6 +2,26 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# high level, 
+# BTC for each time step in a batch we create multiple heads that each calculated keys, queries and values for each time step.
+# then the keys and queries are multiplied to get attention scores for each time step value to each other time step value
+# then those values are masked to prevent attending to future time steps. 
+# the masked values are softmaxed and then multiplied with the values to get a weighted sum for each time step.
+# this is then returned as the new representation for each time step.
+
+# The new representation goes through a feed-forward network to further transform the representation,
+# and then a separate linear layer (lm_head) produces the logits for each character in the vocabulary (the next character prediction)
+
+# So basically a lot of work is put in to get a better representation of each time step.
+# And then that representation is used to predict the next character. 
+# So the back propagation will improve the following weight in relation to the loss:
+	# •	token embeddings
+	# •	positional embeddings
+	# •	Q/K/V projections
+	# •	attention patterns
+	# •	feed-forward weights
+	# •	lm_head
+
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
@@ -80,13 +100,29 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        # For the C in each time step in each batch we compute keys, queries, values
+
+        # We create the attention scores by taking the dot product of queries and keys which gives a T by T matrix for each batch
+        # This is batched matrix multiplication. So each batch is handled independently here:
+        # wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+
+        # We then apply a mask to prevent attending to future tokens 
+        # We then apply softmax to get weights, we multiply the weight with value to get the output
+        # Which is a weighted sum of the weigth * values for each time step T and is of size head_size
+        # the summing is done by the matrix multiplication wei @ v ((B, T, T) @ (B, T, hs) -> (B, T, hs))
+
+        ##
+        # Each attention weight multiplies the value vector of the token it refers to, and the sum of these becomes the
+        # new representation for the current token.
+        ##
+
         # input of size (batch, time-step, channels)
         # output of size (batch, time-step, head size)
         B,T,C = x.shape
         k = self.key(x)   # (B,T,head size)
         q = self.query(x) # (B,T,head size)
         # compute attention scores ("affinities")
-        # Transpose to swal the inner dimensions so that we can matrix multiplication
+        # Transpose to get the dot product between queries and keys
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
